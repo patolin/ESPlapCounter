@@ -1,0 +1,598 @@
+//************************************************************
+// this is a simple example that uses the painlessMesh library to
+// connect to a another network and broadcast message from a webpage to the edges of the mesh network.
+// This sketch can be extended further using all the abilities of the AsyncWebserver library (WS, events, ...)
+// for more details
+// https://gitlab.com/painlessMesh/painlessMesh/wikis/bridge-between-mesh-and-another-network
+// for more details about my version
+// https://gitlab.com/Assassynv__V/painlessMesh
+// and for more details about the AsyncWebserver library
+// https://github.com/me-no-dev/ESPAsyncWebServer
+//************************************************************
+
+
+// cuentavueltas con esp8266 y painlessMesh
+
+#include "IPAddress.h"
+#include "painlessMesh.h"
+
+#ifdef ESP8266
+#include "Hash.h"
+#include <ESPAsyncTCP.h>
+#else
+#include <AsyncTCP.h>
+#endif
+#include <ESPAsyncWebServer.h>
+#include <ArduinoJson.h>
+
+
+#define   MESH_PREFIX     "CuentaVueltasWiFi"
+#define   MESH_PASSWORD   "1234abcd"
+#define   MESH_PORT       5555
+
+#define   STATION_SSID     "mySSID"
+#define   STATION_PASSWORD "myPASSWORD"
+
+#define HOSTNAME "HTTP_BRIDGE"
+
+#define RECV_PIN 2
+#define LED 0
+#define t_vuelta_min 5000
+#define t_led_on 1000
+
+unsigned long t_anterior, t_actual; 
+uint16_t vuelta;
+uint16_t tiempo_vuelta[128];
+unsigned long nodeId;
+
+  bool activado=false;
+  bool pulso_valido=false;
+  bool graba_vuelta=false;
+  bool led_on=false;
+  unsigned long t_led;
+  unsigned long t_pulso;
+
+#define MAX_WS_CLIENT 5
+#define CLIENT_NONE     0
+#define CLIENT_ACTIVE   1
+typedef struct {
+  uint32_t  id;
+  uint8_t   state;
+} _ws_client; 
+
+
+DynamicJsonBuffer  jsonBuffer(2048);
+
+// Prototype
+void receivedCallback( const uint32_t &from, const String &msg );
+IPAddress getlocalIP();
+
+painlessMesh  mesh;
+AsyncWebServer server(80);
+AsyncWebSocket ws("/ws");
+_ws_client ws_client[MAX_WS_CLIENT];
+
+IPAddress myIP(0,0,0,0);
+IPAddress myAPIP(0,0,0,0);
+String s;
+
+const char webPage[] PROGMEM = R"=====(
+<html>
+  <head>
+    <title>Cuentavueltas</title>
+    <style>
+@import url(https://fonts.googleapis.com/css?family=Lato:400,300,300italic,400italic,700,700italic);body,html{height:100%;width:100%;margin:0;padding:0;left:0;top:0;font-size:100%}.center,.container{margin-left:auto;margin-right:auto}*{font-family:Lato,Helvetica,sans-serif;color:#333447;line-height:1.5}h1{font-size:2.5rem}h2{font-size:2rem}h3{font-size:1.375rem}h4{font-size:1.125rem}h5{font-size:1rem}h6{font-size:.875rem}p{font-size:1.125rem;font-weight:200;line-height:1.8}.font-light{font-weight:300}.font-regular{font-weight:400}.font-heavy{font-weight:700}.left{text-align:left}.right{text-align:right}.center{text-align:center}.justify{text-align:justify}.container{width:90%}.row{position:relative;width:100%}.row [class^=col]{float:left;margin:.5rem 2%;min-height:.125rem}.col-1,.col-10,.col-11,.col-12,.col-2,.col-3,.col-4,.col-5,.col-6,.col-7,.col-8,.col-9{width:96%}.col-1-sm{width:4.33%}.col-2-sm{width:12.66%}.col-3-sm{width:21%}.col-4-sm{width:29.33%}.col-5-sm{width:37.66%}.col-6-sm{width:46%}.col-7-sm{width:54.33%}.col-8-sm{width:62.66%}.col-9-sm{width:71%}.col-10-sm{width:79.33%}.col-11-sm{width:87.66%}.col-12-sm{width:96%}.row::after{content:"";display:table;clear:both}.hidden-sm{display:none}@media only screen and (min-width:33.75em){.container{width:80%}}@media only screen and (min-width:45em){.col-1{width:4.33%}.col-2{width:12.66%}.col-3{width:21%}.col-4{width:29.33%}.col-5{width:37.66%}.col-6{width:46%}.col-7{width:54.33%}.col-8{width:62.66%}.col-9{width:71%}.col-10{width:79.33%}.col-11{width:87.66%}.col-12{width:96%}.hidden-sm{display:block}}@media only screen and (min-width:60em){.container{width:75%;max-width:60rem}}
+    </style>
+  </head>
+  <body>
+    <h1>Contador de vueltas</h1>
+    <h2>Tiempo</h2>
+    <div id="divTimer">
+        <p id="timer"> Time : 00:00:00 </p> 
+        <button onclick="ReStartFunction()">ReStart</button>
+        <button onclick="StopFunction()">Stop</button>
+        <button id="pause" onclick="PauseFunction()">pause</button> 
+    </div>
+    <h2>Vueltas</h2>
+    <div id="divVueltas"></div>
+    <div id="botones">
+      <input type="button" id="btnReset" name="btnReset" value="Reset"/>
+      <input type="button" id="btnCarrera" name="btnCarrera" value="Carrera"/>
+      <input type="button" id="btnConectar" name="btnConectar" value="Conectar"/>
+    </div>
+    <div id="config">
+      <input type="text" id="txtGw" name="txtGw" value="10.1.186.1"/>
+      <input type="hidden" id="txtJson" name="txtJson" value='{"vueltas":3, "0":123, "1": 98, "2":143, "3":453 }'/>
+      <input type="hidden" id="btnTest" name="btnTest" value="Test" onclick="muestraVueltas()" />   
+    </div>
+  
+  <script type="text/javascript">
+var pause=0;
+var count=0;
+var counter=setInterval(timer, 1000); 
+var stoped=0;
+
+window.WebSocket = window.WebSocket || window.MozWebSocket;
+var connection = new WebSocket('ws://'+document.getElementById("txtGw").value+"/ws");
+  connection.onopen = function () {
+    // connection is opened and ready to use
+  };
+
+  connection.onerror = function (error) {
+    // an error occurred when sending/receiving data
+  };
+
+  connection.onmessage = function (message) {
+    // try to decode json (I assume that each message
+    // from server is json)
+    try {
+      var json = JSON.parse(message.data);
+    } catch (e) {
+      console.log('This doesn\'t look like a valid JSON: ',
+          message.data);
+      return;
+    }
+    // handle incoming message
+  document.getElementById("txtJson").value=message.data;
+  muestraVueltas();
+
+  };
+
+
+StopFunction();
+function timer()
+{
+  count=count+1;
+  document.getElementById("timer").innerHTML=count + " secs";
+  var context = new (window.AudioContext || window.webkitAudioContext)();
+  var osc = context.createOscillator(); // instantiate an oscillator
+  osc.type = 'square'; // this is the default - also square, sawtooth, triangle
+  osc.connect(context.destination); // connect it to the destination
+
+  if (count<0) {
+    osc.frequency.value = 440; // Hz
+  osc.start(); // start the oscillator
+  osc.stop(context.currentTime + 0.1);
+  }
+  if (count==0) {
+    osc.frequency.value = 880; // Hz
+  osc.start(); // start the oscillator
+  osc.stop(context.currentTime + 1);
+  }
+
+
+}
+
+function StopFunction()
+{
+  clearInterval(counter);
+  window.count=0;
+  window.pause=0;
+  document.getElementById("pause").innerHTML="Pause"
+  window.stoped=1
+  document.getElementById("timer").innerHTML=count + " secs";
+}
+
+function ReStartFunction()
+{
+  if (counter) {
+  connection.send(JSON.stringify({"cmd": "rst"}));
+  document.getElementById("divVueltas").innerHTML='';
+  
+  clearInterval(counter);
+    window.pause=0;
+    window.count=-5;
+    window.stoped=0
+    window.counter=setInterval(timer, 1000); 
+    count=count+1;
+    document.getElementById("pause").innerHTML="Pause"
+    document.getElementById("timer").innerHTML=count + " secs"; 
+
+  }
+}
+
+function PauseFunction()
+{
+  if (stoped==0)
+  { 
+    if (pause==0) 
+    {
+      clearInterval(counter);
+      document.getElementById("pause").innerHTML="Resume"
+      pause=1;
+      return;
+    }
+
+  if (pause==1) 
+    {
+      window.counter=setInterval(timer, 1000); 
+      document.getElementById("timer").innerHTML=count + " secs"; 
+      document.getElementById("pause").innerHTML="Pause"
+      pause=0;
+      return;
+    }
+  }
+  return;
+} 
+
+function muestraVueltas() {
+  var context = new (window.AudioContext || window.webkitAudioContext)();
+  var osc = context.createOscillator(); // instantiate an oscillator
+  osc.type = 'sine'; // this is the default - also square, sawtooth, triangle
+  osc.frequency.value = 440; // Hz
+  osc.connect(context.destination); // connect it to the destination
+  osc.start(); // start the oscillator
+  osc.stop(context.currentTime + 0.25);
+  
+
+     
+  var info=document.getElementById("txtJson").value;
+  console.log(info);
+  var datos=JSON.parse(info);
+  console.log(datos);
+  var vueltasTipo=datos["tipo"];
+  if (vueltasTipo=="vueltas") {
+    var vueltasTotal=datos["total"];
+    var idTransponder=datos["id"];
+    var tabla='<table border="1" cellpadding="3">';
+    tabla+='<tr>';
+    tabla+='<th>Vuelta</th><th>Tiempo</th>';
+    tabla+='</tr>';
+    tabla+='<tr>';
+    tabla+='<th>&nbsp;</th><th>'+idTransponder+'</th>';
+    tabla+='</tr>';
+
+    for (i=0;i<=vueltasTotal;i++) {
+      tabla+='<tr>';
+      tabla+='<td>'+i+'</td><td>'+datos[i]+'</td>';
+      tabla+='</tr>';
+  
+    }
+
+  }
+  
+  tabla+='</table>';
+  document.getElementById("divVueltas").innerHTML=tabla;
+
+}
+  </script>
+  </body>
+
+</html>
+
+)=====";
+
+
+/* ======================================================================
+Function: onEvent
+Purpose : Manage routing of websocket events
+Input   : -
+Output  : - 
+Comments: -
+====================================================================== */
+void onEvent(AsyncWebSocket * server, AsyncWebSocketClient * client, AwsEventType type, void * arg, uint8_t *data, size_t len){
+  JsonObject& lapsJson = jsonBuffer.createObject();
+  String txtJson;
+  lapsJson["tipo"]="socketEvt";
+  if(type == WS_EVT_CONNECT){
+    uint8_t index;
+    Serial.printf("ws[%s][%u] connect\n", server->url(), client->id());
+
+    for (index=0; index<MAX_WS_CLIENT ; index++) {
+      if (ws_client[index].id == 0 ) {
+        ws_client[index].id = client->id();
+        ws_client[index].state = CLIENT_ACTIVE;
+        Serial.printf("added #%u at index[%d]\n", client->id(), index);
+        
+        lapsJson["evt"]="connect";
+        lapsJson["val"]="Hello Client "+String(client->id())+", added you at index "+String(index);
+        lapsJson.printTo(txtJson);
+        client->text(txtJson);
+        client->ping();
+        break; // Exit for loop
+      }
+    }
+    if (index>=MAX_WS_CLIENT) {
+      Serial.printf("not added, table is full");
+      lapsJson["evt"]="err_max_clients";
+        lapsJson["val"]="No connect. Limit of "+String(MAX_WS_CLIENT)+" reached";
+        lapsJson.printTo(txtJson);
+        client->text(txtJson);
+        
+      client->ping();
+    }
+
+  } else if(type == WS_EVT_DISCONNECT){
+    Serial.printf("ws[%s][%u] disconnect: %u\n", server->url(), client->id());
+    for (uint8_t i=0; i<MAX_WS_CLIENT ; i++) {
+      if (ws_client[i].id == client->id() ) {
+        ws_client[i].id = 0;
+        ws_client[i].state = CLIENT_NONE;
+        Serial.printf("freed[%d]\n", i);
+        break; // Exit for loop
+      }
+    }
+  } else if(type == WS_EVT_ERROR){
+    Serial.printf("ws[%s][%u] error(%u): %s\n", server->url(), client->id(), *((uint16_t*)arg), (char*)data);
+  } else if(type == WS_EVT_PONG){
+    Serial.printf("ws[%s][%u] pong[%u]: %s\n", server->url(), client->id(), len, (len)?(char*)data:"");
+  } else if(type == WS_EVT_DATA){
+    //data packet
+    AwsFrameInfo * info = (AwsFrameInfo*) arg;
+    char * msg = NULL;
+    size_t n = info->len;
+    uint8_t index;
+
+    // Size of buffer needed
+    // String same size +1 for \0
+    // Hex size*3+1 for \0 (hex displayed as "FF AA BB ...")
+    n = info->opcode == WS_TEXT ? n+1 : n*3+1;
+
+    msg = (char*) calloc(n, sizeof(char));
+    if (msg) {
+      // Grab all data
+      for(size_t i=0; i < info->len; i++) {
+        if (info->opcode == WS_TEXT ) {
+          msg[i] = (char) data[i];
+        } else {
+          sprintf_P(msg+i*3, PSTR("%02x "), (uint8_t) data[i]);
+        }
+      }
+    }
+
+    
+    Serial.printf("ws[%s][%u] message %s\n", server->url(), client->id(), msg);
+
+    // decodificamos el mensaje json recibido
+    JsonObject& recvJson = jsonBuffer.parseObject(msg);
+    if (recvJson["cmd"]=="rst") {
+      // reset
+      vuelta=0;
+      
+      
+    }
+    if (recvJson["cmd"]=="inf") {
+      // get info
+      enviaWsVueltas();
+    }
+
+    /*
+    // Search if it's a known client
+    for (index=0; index<MAX_WS_CLIENT ; index++) {
+      if (ws_client[index].id == client->id() ) {
+        Serial.printf("known[%d] '%s'\n", index, msg);
+        Serial.printf("client #%d info state=%d\n", client->id(), ws_client[index].state);
+
+        // Received text message
+        if (info->opcode == WS_TEXT) {
+          //execCommand(client, msg);
+        } else {
+          Serial.printf("Binary 0x:%s", msg);
+        }
+        // Exit for loop
+        break;
+      } // if known client
+    } // for all clients
+    */
+    // Free up allocated buffer
+    if (msg) 
+      free(msg);
+
+  } // EVT_DATA
+  
+}
+
+void enviaWsVueltas() {
+   JsonObject& lapsJson = jsonBuffer.createObject();
+        lapsJson["tipo"]="vueltas";
+        lapsJson["id"]=nodeId;
+        lapsJson["total"]=(vuelta-1);
+        for (int i=0;i<vuelta;i++) {
+           lapsJson[String(i)]=tiempo_vuelta[i];       
+        }
+        String lapsStr;
+        lapsJson.printTo(lapsStr);
+        
+        ws.textAll(lapsStr);
+  
+}
+
+void setup() {
+  Serial.begin(115200);
+  pinMode(LED, OUTPUT);
+  pinMode(RECV_PIN, INPUT);
+
+  //mesh.setDebugMsgTypes( ERROR | STARTUP | CONNECTION );  // set before init() so that you can see startup messages
+
+  // Channel set to 6. Make sure to use the same channel for your mesh and for you other
+  // network (STATION_SSID)
+  mesh.init( MESH_PREFIX, MESH_PASSWORD, MESH_PORT, STA_AP, WIFI_AUTH_WPA2_PSK, 6 );
+  mesh.onReceive(&receivedCallback);
+
+  mesh.stationManual(STATION_SSID, STATION_PASSWORD);
+  mesh.setHostname(HOSTNAME);
+  myAPIP = IPAddress(mesh.getAPIP().addr);
+  Serial.println("My AP IP is " + myAPIP.toString());
+  nodeId=mesh.getNodeId();;
+  Serial.println("My nodeId is "+String(nodeId));
+  // Enable and start websockets
+  ws.onEvent(onEvent);
+  server.addHandler(&ws);
+
+  //Async webserver
+  server.on("/", HTTP_GET, [](AsyncWebServerRequest *request){
+    s += "<h1>Tiempos por vuelta</h1>";
+        s += "<table border=\"1\" cellpadding=\"2\">";
+        s += "<tr><th>Num.</th><th>Vueltas</th>";
+        for (int i=1;i<=vuelta;i++) {
+          s += "<th>"+String(i)+"</th>";
+        }
+        s += "</tr>";
+        if (vuelta>0) {
+            /*
+            s += String(i) + "\t";
+            s += String(lapsCounter[i].vueltas) + "\t";
+            for (j=0;j<lapsCounter[i].vueltas;j++) {
+              s += String(convierteTiempoDec(lapsCounter[i].tiempos[j]/100)) + "\t";
+            }
+            s += "\n";
+            */
+            s += "<tr>";
+            s += "<td>" + String(vuelta) + "</td>";
+            for (int j=1;j<=vuelta;j++) {
+              s += "<td>";
+              s += String(convierteTiempoDec(tiempo_vuelta[j]));
+              s += "</td>";
+            }
+            s += "</tr>";
+        }
+          
+        
+        
+    
+        s += "</table>";
+        s += "<p><a href=\"/reset\">Reiniciar</a></p>";
+        s += "<pre>(c) www.patolin.com - 2018 </pre>";
+        s += "</html>\n";  
+        
+    //request->send(200, "text/html", "<form>Text to Broadcast<br><input type='text' name='BROADCAST'><br><br><input type='submit' value='Submit'></form>");
+    request->send(200, "text/html", webPage);
+    /*
+    if (request->hasArg("BROADCAST")){
+      String msg = request->arg("BROADCAST");
+      mesh.sendBroadcast(msg);
+    }
+    */
+  });
+
+  server.on("/reset", HTTP_GET, [](AsyncWebServerRequest *request){
+    vuelta=0;
+    request->redirect("/");   
+  });
+  server.begin();
+
+  // reset lap counters
+  vuelta=0;
+
+}
+
+void loop() {
+
+  
+  t_actual=millis();
+  mesh.update();
+  
+  
+  if(myIP != getlocalIP()){
+    myIP = getlocalIP();
+    Serial.println("My IP is " + myIP.toString());
+  }
+  if (digitalRead(RECV_PIN)==0) {
+    
+    activado=true;
+    t_pulso=millis();
+  } else {
+    activado=false;
+  }
+
+  if (activado==true) {
+    delay(1);
+      // delay de 1ms para evitar impulsos erroneos
+    if (digitalRead(RECV_PIN)==0) {
+      pulso_valido=true;
+      //Serial.println("Pulso!");
+    } else {
+      pulso_valido=false;
+    }
+  }
+
+  if (pulso_valido==true) {
+    if (vuelta==0) {
+      tiempo_vuelta[vuelta]=0;
+      Serial.println("Vuelta: " + String(vuelta) + "\tt: " + String(tiempo_vuelta[vuelta]));
+      vuelta++;
+      t_anterior=t_actual;
+    } else {
+      unsigned long t0=t_actual-t_anterior;
+      //Serial.println("Vuelta: " + String(vuelta) + "\tt: " + String(t0));
+      
+      if (t0>t_vuelta_min) {
+        t_anterior=t_actual;
+        tiempo_vuelta[vuelta]=(uint16_t)(t0/100);
+        Serial.println("Vuelt*: " + String(vuelta) + "\tt: " + String(tiempo_vuelta[vuelta]) + "\tt: " + convierteTiempoDec(tiempo_vuelta[vuelta] ));
+        led_on=true;
+        t_led=t_actual;
+        vuelta++;
+        t_anterior=t_actual;
+        
+        JsonObject& lapsJson = jsonBuffer.createObject();
+        lapsJson["tipo"]="vueltas";
+        lapsJson["id"]=nodeId;
+        lapsJson["total"]=(vuelta-1);
+        for (int i=0;i<vuelta;i++) {
+           lapsJson[String(i)]=tiempo_vuelta[i];       
+        }
+        String lapsStr;
+        lapsJson.printTo(lapsStr);
+        
+        ws.textAll(lapsStr);
+      }
+    }
+    pulso_valido=false;
+  }
+
+  
+  if (led_on==true) {
+    
+    if ((t_actual-t_led)>t_led_on) {
+      digitalWrite(LED,1);
+      led_on=false;
+      t_led=0;
+      delay(1);
+    } else {
+      digitalWrite(LED,0);
+    }
+    
+  } else {
+    digitalWrite(LED,1);
+  }
+  
+
+  
+}
+
+void receivedCallback( const uint32_t &from, const String &msg ) {
+  Serial.printf("bridge: Received from %u msg=%s\n", from, msg.c_str());
+}
+
+IPAddress getlocalIP() {
+  return IPAddress(mesh.getStationIP().addr);
+}
+
+void resetCounter() {
+  // ponemos en 0 el contador
+  vuelta=0;
+}
+
+String convierteTiempoDec(int tsec) {
+  
+  int tM, tS, tD;
+  String sM, sS, sD;
+  int tT=tsec/10;
+  tM=tT/60;
+  tS=tT-(tM*60);
+  tD=tsec%10;
+  //return String(tM)+':'+String(tS);
+  if (tM<10) {
+    sM='0'+String(tM);
+  } else {
+    sM=String(tM);
+  }
+  if (tS<10) {
+    sS='0'+String(tS);
+  } else {
+    sS=String(tS);
+  }
+  sD=String(tD);
+  return sM+':'+sS+"."+sD;
+}
